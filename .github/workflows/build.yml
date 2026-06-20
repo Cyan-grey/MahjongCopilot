@@ -24,9 +24,9 @@ jobs:
           pip install playwright
           playwright install chromium
 
-      - name: Build with PyInstaller
+      - name: Build with PyInstaller using spec file
         run: |
-          pyinstaller --onefile --name MahjongCopilot main.py
+          pyinstaller MahjongCopilot.spec
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
