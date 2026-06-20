@@ -48,11 +48,160 @@ class MortalEngine:
             return self._react_batch(obs, masks, invisible_obs)
 
     def _react_batch(self, obs, masks, invisible_obs):
-        obs = torch.as_tensor(np.stack(obs, axis=0), device=self.device)
-        masks = torch.as_tensor(np.stack(masks, axis=0), device=self.device)
-        invisible_obs = None
-        if self.is_oracle:
-            invisible_obs = torch.as_tensor(np.stack(invisible_obs, axis=0), device=self.device)
+        # Same robust conversion as 4p engine
+        import numpy as _np
+        # import LOGGER for debug; fall back silently if not available
+        try:
+            from common.log_helper import LOGGER
+        except Exception:
+            LOGGER = None
+
+        def _safe_stack(list_of_items, dtype=None, bool_mask=False):
+                arrs = []
+                for item in list_of_items:
+                    try:
+                        a = _np.asarray(item)
+                    except Exception:
+                        a = _np.array(item, dtype=object)
+                    arrs.append(a)
+
+                # If all elements are scalar-like, return 1D numeric/bool array
+                scalar_flags = [(_np.isscalar(a) or (isinstance(a, _np.ndarray) and getattr(a, 'shape', ()) == ())) for a in arrs]
+                if all(scalar_flags):
+                    vals = []
+                    for a in arrs:
+                        try:
+                            v = float(a)
+                        except Exception:
+                            v = 0.0
+                        vals.append(v)
+                    if bool_mask:
+                        return _np.array([bool(x) for x in vals], dtype=_np.bool_)
+                    else:
+                        target_dtype = _np.float32 if dtype is None else dtype
+                        return _np.array(vals, dtype=target_dtype)
+
+                # If shapes are identical, try a direct stack
+                shapes = [getattr(a, 'shape', ()) for a in arrs]
+                if len(set(shapes)) == 1:
+                    try:
+                        stacked = _np.stack(arrs, axis=0)
+                        if dtype is not None and stacked.dtype != dtype:
+                            stacked = stacked.astype(dtype)
+                        if bool_mask:
+                            stacked = stacked.astype(_np.bool_)
+                        return stacked
+                    except Exception:
+                        pass
+
+                # Handle common ragged case: 1D arrays of varying lengths -> pad to max length
+                if all(isinstance(a, _np.ndarray) and a.ndim <= 1 for a in arrs):
+                    maxlen = max((0 if a.shape == () else a.shape[0]) for a in arrs)
+                    coerced = []
+                    for a in arrs:
+                        if getattr(a, 'shape', ()) == ():
+                            v = _np.asarray([a], dtype=_np.float32)
+                        else:
+                            v = _np.asarray(a, dtype=_np.float32)
+                        if v.shape[0] < maxlen:
+                            pad = _np.zeros((maxlen - v.shape[0],), dtype=_np.float32)
+                            v = _np.concatenate([v, pad])
+                        elif v.shape[0] > maxlen:
+                            v = v[:maxlen]
+                        coerced.append(v)
+                    stacked = _np.stack(coerced, axis=0)
+                    if dtype is not None and stacked.dtype != dtype:
+                        stacked = stacked.astype(dtype)
+                    if bool_mask:
+                        stacked = stacked.astype(_np.bool_)
+                    return stacked
+
+                # Fallback: try element-wise conversion to requested dtype then stack
+                try:
+                    target_dtype = _np.bool_ if bool_mask else (_np.float32 if dtype is None else dtype)
+                    coerced = [_np.asarray(a, dtype=target_dtype) for a in arrs]
+                    stacked = _np.stack(coerced, axis=0)
+                    return stacked
+                except Exception:
+                    # Last resort: reduce to 1D numeric list (best-effort)
+                    flat = []
+                    for a in arrs:
+                        try:
+                            flat.append(float(a))
+                        except Exception:
+                            flat.append(0.0)
+                    if bool_mask:
+                        return _np.array([bool(x) for x in flat], dtype=_np.bool_)
+                    else:
+                        return _np.array(flat, dtype=_np.float32)
+
+        obs_np = _safe_stack(obs, dtype=_np.float32, bool_mask=False)
+        masks_np = _safe_stack(masks, dtype=_np.bool_, bool_mask=True)
+
+        invisible_np = None
+        if self.is_oracle and invisible_obs is not None:
+            try:
+                invisible_np = _safe_stack(invisible_obs, dtype=_np.float32, bool_mask=False)
+            except Exception:
+                invisible_np = None
+
+        try:
+            if LOGGER is not None:
+                LOGGER.debug("engine3p._react_batch post-stack obs_np: type=%s, shape=%s, dtype=%s, is_object=%s",
+                             type(obs_np), getattr(obs_np, 'shape', None), getattr(getattr(obs_np, 'dtype', None), 'name', None),
+                             getattr(obs_np, 'dtype', None) == _np.dtype('object'))
+                LOGGER.debug("engine3p._react_batch post-stack masks_np: type=%s, shape=%s, dtype=%s, is_object=%s",
+                             type(masks_np), getattr(masks_np, 'shape', None), getattr(getattr(masks_np, 'dtype', None), 'name', None),
+                             getattr(masks_np, 'dtype', None) == _np.dtype('object'))
+            else:
+                # fallback to printing when LOGGER not available
+                print("engine3p._react_batch post-stack obs_np:", type(obs_np), getattr(obs_np, 'shape', None), getattr(getattr(obs_np, 'dtype', None), 'name', None))
+                print("engine3p._react_batch post-stack masks_np:", type(masks_np), getattr(masks_np, 'shape', None), getattr(getattr(masks_np, 'dtype', None), 'name', None))
+        except Exception:
+            if LOGGER is not None:
+                LOGGER.debug("engine3p._react_batch: failed to log post-stack shapes")
+
+        try:
+            obs_np_c = _np.ascontiguousarray(_np.asarray(obs_np, dtype=_np.float32))
+            masks_np_c = _np.ascontiguousarray(_np.asarray(masks_np, dtype=_np.bool_))
+            try:
+                obs = torch.from_numpy(obs_np_c).to(self.device)
+                masks = torch.from_numpy(masks_np_c).to(self.device)
+            except Exception as e_inner:
+                try:
+                    if LOGGER is not None:
+                        LOGGER.warning("engine3p._react_batch.from_numpy failed, falling back to torch.tensor(list): %s", e_inner)
+                    else:
+                        print("engine3p._react_batch.from_numpy failed, falling back:", e_inner)
+                except Exception:
+                    pass
+                obs = torch.tensor(obs_np_c.tolist(), dtype=torch.float32, device=self.device)
+                masks = torch.tensor(masks_np_c.tolist(), dtype=torch.bool, device=self.device)
+        except Exception as e:
+            try:
+                ro = repr(obs_np)
+                if len(ro) > 500:
+                    ro = ro[:500] + '...(truncated)'
+                rm = repr(masks_np)
+                if len(rm) > 500:
+                    rm = rm[:500] + '...(truncated)'
+                if LOGGER is not None:
+                    LOGGER.error("engine3p._react_batch tensor conversion failed: %s", e)
+                    LOGGER.debug("obs_np repr: %s", ro)
+                    LOGGER.debug("masks_np repr: %s", rm)
+                else:
+                    print("engine3p._react_batch tensor conversion failed:", e)
+                    print("obs_np repr:", ro)
+                    print("masks_np repr:", rm)
+            except Exception:
+                if LOGGER is not None:
+                    LOGGER.debug("engine3p._react_batch: failed to capture reprs for failing conversion")
+            raise
+        if invisible_np is not None:
+            invisible_obs = torch.as_tensor(invisible_np, device=self.device)
+        else:
+            invisible_obs = None
+
         batch_size = obs.shape[0]
 
         match self.version:
@@ -76,7 +225,29 @@ class MortalEngine:
             is_greedy = torch.ones(batch_size, dtype=torch.bool, device=self.device)
             actions = q_out.argmax(-1)
 
-        return actions.tolist(), q_out.tolist(), masks.tolist(), is_greedy.tolist()
+        try:
+            actions_list = [int(x) for x in actions.tolist()]
+        except Exception:
+            actions_list = actions.tolist()
+
+        try:
+            q_out_np = q_out.detach().cpu().numpy()
+            q_out_list = [[float(x) for x in row] for row in q_out_np]
+        except Exception:
+            q_out_list = q_out.tolist()
+
+        try:
+            masks_np_out = masks.detach().cpu().numpy()
+            masks_list = [[bool(x) for x in row] for row in masks_np_out]
+        except Exception:
+            masks_list = masks.tolist()
+
+        try:
+            is_greedy_list = [bool(x) for x in is_greedy.tolist()]
+        except Exception:
+            is_greedy_list = is_greedy.tolist()
+
+        return actions_list, q_out_list, masks_list, is_greedy_list
 
 def sample_top_p(logits, p):
     if p >= 1:
